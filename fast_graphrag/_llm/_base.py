@@ -1,15 +1,18 @@
 """LLM Services module."""
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple, Type, TypeVar, Union
 
+import json_repair
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from fast_graphrag._models import BaseModelAlias
 from fast_graphrag._prompt import PROMPTS
+from fast_graphrag._utils import logger
 
 T_model = TypeVar("T_model", bound=Union[BaseModel, BaseModelAlias])
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
@@ -60,6 +63,76 @@ async def format_and_send_prompt(
     prompt = PROMPTS[prompt_key]
     formatted_prompt = prompt.format(**format_kwargs)
     return await llm.send_message(prompt=formatted_prompt, response_model=response_model, **args)
+
+
+async def format_and_send_prompt_with_json_repair(
+  prompt_key: str,
+  llm: "BaseLLMService",
+  format_kwargs: dict[str, Any],
+  response_model: Type[T_model],
+  **args: Any,
+) -> Tuple[T_model, list[dict[str, str]]]:
+  """Get a prompt, format it with the supplied args, and send it to the LLM with JSON repair fallback.
+
+  This function wraps format_and_send_prompt and adds JSON repair capabilities for handling
+  truncated or malformed JSON responses from LLMs.
+
+  Args:
+      Same as format_and_send_prompt
+
+  Returns:
+      Same as format_and_send_prompt
+  """
+  try:
+    # First try the normal approach
+    return await format_and_send_prompt(prompt_key, llm, format_kwargs, response_model, **args)
+  except ValidationError as e:
+    # If we get a validation error, it might be due to truncated JSON
+    logger.warning(f"Validation error in format_and_send_prompt for {prompt_key}, attempting JSON repair: {e}")
+
+    # Try to get raw response without validation
+    system_key = prompt_key + "_system"
+
+    if system_key in PROMPTS:
+      system = PROMPTS[system_key]
+      prompt = PROMPTS[prompt_key + "_prompt"]
+      formatted_system = system.format(**format_kwargs)
+      formatted_prompt = prompt.format(**format_kwargs)
+      raw_response, messages = await llm.send_message(
+        system_prompt=formatted_system, prompt=formatted_prompt, response_model=None, **args
+      )
+    else:
+      prompt = PROMPTS[prompt_key]
+      formatted_prompt = prompt.format(**format_kwargs)
+      raw_response, messages = await llm.send_message(prompt=formatted_prompt, response_model=None, **args)
+
+    # If we got a string response, try to repair it
+    if isinstance(raw_response, str):
+      try:
+        logger.debug(f"Attempting to repair JSON response: {raw_response[:200]}...")
+        repaired_json = json_repair.repair_json(raw_response, ensure_ascii=False)
+        logger.debug(f"Repaired JSON: {repaired_json[:200]}...")
+
+        # Parse and validate
+        parsed_data = json.loads(repaired_json)
+
+        # Handle BaseModelAlias types
+        if hasattr(response_model, "__bases__"):
+          for base in response_model.__bases__:
+            if base.__name__ == "BaseModelAlias":
+              # Handle BaseModelAlias types
+              model_class = getattr(response_model, "Model", response_model)
+              return model_class(**parsed_data), messages
+
+        # Handle regular Pydantic models
+        return response_model(**parsed_data), messages
+      except Exception as repair_error:
+        logger.error(f"Failed to repair JSON: {repair_error}")
+        # Re-raise the original validation error
+        raise e
+    else:
+      # If response is not a string, re-raise original error
+      raise e
 
 
 @dataclass

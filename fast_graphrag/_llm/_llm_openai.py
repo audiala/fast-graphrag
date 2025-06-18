@@ -1,23 +1,19 @@
 """OpenAI-compatible LLM Services module."""
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any, List, Literal, Optional, Tuple, Type, cast
 
 import instructor
+import json_repair
 import numpy as np
 import tiktoken
 from aiolimiter import AsyncLimiter
 from openai import APIConnectionError, AsyncAzureOpenAI, AsyncOpenAI, RateLimitError
-from pydantic import BaseModel
-from tenacity import (
-  AsyncRetrying,
-  retry,
-  retry_if_exception_type,
-  stop_after_attempt,
-  wait_exponential,
-)
+from pydantic import BaseModel, ValidationError
+from tenacity import AsyncRetrying, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from fast_graphrag._exceptions import LLMServiceNoResponseError
 from fast_graphrag._types import BaseModelAlias
@@ -36,6 +32,7 @@ class OpenAILLMService(BaseLLMService):
   mode: instructor.Mode = field(default=instructor.Mode.JSON)
   client: Literal["openai", "azure"] = field(default="openai")
   api_version: Optional[str] = field(default=None)
+  use_json_repair: bool = field(default=True)  # Enable JSON repair by default
 
   def __post_init__(self):
     self.encoding = None
@@ -59,21 +56,19 @@ class OpenAILLMService(BaseLLMService):
       assert (
         self.base_url is not None and self.api_version is not None
       ), "Azure OpenAI requires a base url and an api version."
-      self.llm_async_client = instructor.from_openai(
-        AsyncAzureOpenAI(
-          azure_endpoint=self.base_url,
-          api_key=self.api_key,
-          api_version=self.api_version,
-          timeout=TIMEOUT_SECONDS,
-        ),
-        mode=self.mode,
+      client = AsyncAzureOpenAI(
+        azure_endpoint=self.base_url,
+        api_key=self.api_key,
+        api_version=self.api_version,
+        timeout=TIMEOUT_SECONDS,
       )
     elif self.client == "openai":
-      self.llm_async_client = instructor.from_openai(
-        AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=TIMEOUT_SECONDS), mode=self.mode
-      )
+      client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=TIMEOUT_SECONDS)
     else:
       raise ValueError("Invalid client type. Must be 'openai' or 'azure'")
+
+    self.llm_async_client = instructor.from_openai(client, mode=self.mode)
+    self._raw_client = client  # Keep reference to raw client for JSON repair fallback
 
     logger.debug("Initialized OpenAILLMService with patched OpenAI client.")
 
@@ -123,15 +118,28 @@ class OpenAILLMService(BaseLLMService):
 
             messages.append({"role": "user", "content": prompt})
 
-            llm_response: T_model = await self.llm_async_client.chat.completions.create(
-              model=model,
-              messages=messages,  # type: ignore
-              response_model=response_model.Model
-              if response_model and issubclass(response_model, BaseModelAlias)
-              else response_model,
-              **kwargs,
-              max_retries=AsyncRetrying(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)),
-            )
+            try:
+              # First attempt with instructor
+              llm_response: T_model = await self.llm_async_client.chat.completions.create(
+                model=model,
+                messages=messages,  # type: ignore
+                response_model=response_model.Model
+                if response_model and issubclass(response_model, BaseModelAlias)
+                else response_model,
+                **kwargs,
+                max_retries=AsyncRetrying(
+                  stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
+                ),
+              )
+            except ValidationError as e:
+              # If we get a validation error and JSON repair is enabled, try to repair
+              if self.use_json_repair and response_model:
+                logger.warning(f"Validation error, attempting JSON repair: {e}")
+                llm_response = await self._send_with_json_repair(
+                  model=model, messages=messages, response_model=response_model, **kwargs
+                )
+              else:
+                raise
 
             if not llm_response:
               logger.error("No response received from the language model.")
@@ -152,6 +160,45 @@ class OpenAILLMService(BaseLLMService):
           except Exception:
             logger.exception("An error occurred:", exc_info=True)
             raise
+
+  async def _send_with_json_repair(
+    self,
+    model: str,
+    messages: list[dict[str, str]],
+    response_model: Type[T_model],
+    **kwargs: Any,
+  ) -> T_model:
+    """Send message with JSON repair fallback."""
+    try:
+      # Get raw response without instructor parsing
+      raw_response = await self._raw_client.chat.completions.create(
+        model=model,
+        messages=messages,  # type: ignore
+        response_format={"type": "json_object"} if self.mode == instructor.Mode.JSON else None,
+        **kwargs,
+      )
+
+      if raw_response.choices and raw_response.choices[0].message.content:
+        raw_json = raw_response.choices[0].message.content
+        logger.debug(f"Raw JSON response: {raw_json[:200]}...")
+
+        # Repair the JSON
+        repaired_json = json_repair.repair_json(raw_json, ensure_ascii=False)
+        logger.debug(f"Repaired JSON: {repaired_json[:200]}...")
+
+        # Parse and validate
+        parsed_data = json.loads(repaired_json)
+
+        # Handle BaseModelAlias types
+        if issubclass(response_model, BaseModelAlias):
+          return response_model.Model(**parsed_data)
+        else:
+          return response_model(**parsed_data)
+      else:
+        raise LLMServiceNoResponseError("No content in response")
+    except Exception as e:
+      logger.error(f"Failed to repair JSON: {e}")
+      raise
 
 
 @dataclass

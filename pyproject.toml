@@ -1,32 +1,23 @@
 [tool.poetry]
 name = "fast-graphrag"
-version = "0.0.5"
+version = "0.0.6"
 description = ""
 authors = ["Luca Pinchetti <luca@circlemind.co>", "Antonio Vespoli <antonio@circlemind.co>", "Yuhang Song <yuhang@circlemind.co>"]
 packages = [{include = "fast_graphrag" }]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.13"
+python = ">=3.10,<3.16"
 igraph = "^0.11.6"
 xxhash = "^3.5.0"
 pydantic = "^2.9.2"
 scipy = "^1.14.1"
 scikit-learn = "^1.5.2"
-tenacity = "^9.0.0"
-openai = "^1.52.1"
 scipy-stubs = "^1.14.1.5"
 hnswlib = "^0.8.0"
 instructor = "^1.6.3"
 requests = "^2.32.3"
 python-dotenv = "^1.0.1"
-tiktoken = "^0.8.0"
-aiolimiter = "^1.1.0"
-google-genai = "^1.3.0"
-vertexai = "^1.71.1"
-sentencepiece = "^0.2.0"
-json-repair = "^0.39.1"
-voyageai = "^0.3.2"
 
 
 [tool.poetry.group.dev.dependencies]
